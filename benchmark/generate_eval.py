@@ -8,6 +8,7 @@ This script recursively generates motions using Kimodo from a test suite folder 
 """
 
 import argparse
+import json
 import shutil
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from tqdm.auto import tqdm
 from kimodo.constraints import load_constraints_lst
 from kimodo.meta import parse_prompts_from_meta
 from kimodo.model import DEFAULT_MODEL, load_model
+from kimodo.model.text_encoder_registry import TEXT_ENCODER_PRESETS
 from kimodo.tools import load_json, seed_everything
 
 
@@ -75,6 +77,10 @@ def parse_args():
         "--text_encoder_fp32",
         action="store_true",
         help="Uses fp32 for instantiating the text encoder (if API is not already running) rather than default bfloat16.",
+    )
+    parser.add_argument(
+        "--text_encoder", choices=sorted(TEXT_ENCODER_PRESETS), default=None,
+        help="Explicit text encoder preset; local checkpoints normally infer this from text-model.json.",
     )
     return parser.parse_args()
 
@@ -225,6 +231,7 @@ def main():
         default_family="Kimodo",
         return_resolved_name=True,
         text_encoder_fp32=args.text_encoder_fp32,
+        text_encoder_name=args.text_encoder,
     )
     # v1.1 models are meant to be used for benchmark evaluation
     _deprecated_for_benchmark = {
@@ -240,6 +247,11 @@ def main():
             stacklevel=1,
         )
     print(f"Generating with model: {resolved_name}")
+    generated_root.mkdir(parents=True, exist_ok=True)
+    provenance = getattr(model.text_encoder, "provenance", {"preset": args.text_encoder or "unknown"})
+    (generated_root / "generation-text-model.json").write_text(
+        json.dumps(provenance, indent=2) + "\n", encoding="utf-8"
+    )
     fps = model.fps
     default_diffusion_steps = args.diffusion_steps
 

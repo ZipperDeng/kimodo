@@ -7,7 +7,7 @@ import os
 import gradio as gr
 import numpy as np
 
-from kimodo.model import resolve_target
+from kimodo.model import TEXT_ENCODER_PRESETS, build_text_encoder_config, resolve_target
 
 from .gradio_theme import get_gradio_theme
 
@@ -17,19 +17,6 @@ DEFAULT_SERVER_NAME = "0.0.0.0"
 DEFAULT_SERVER_PORT = 9550
 DEFAULT_TMP_FOLDER = "/tmp/text_encoder/"
 DEFAULT_TEXT_ENCODER = "llm2vec"
-TEXT_ENCODER_PRESETS = {
-    "llm2vec": {
-        "target": "kimodo.model.LLM2VecEncoder",
-        "kwargs": {
-            "base_model_name_or_path": "McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp",
-            "peft_model_name_or_path": "McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised",
-            "dtype": "bfloat16",
-            "llm_dim": 4096,
-            "device": "auto",
-        },
-        "display_name": "LLM2Vec",
-    }
-}
 
 
 class DemoWrapper:
@@ -61,11 +48,9 @@ def _build_text_encoder(name: str, fp32: bool = False):
     if name not in TEXT_ENCODER_PRESETS:
         available = ", ".join(sorted(TEXT_ENCODER_PRESETS))
         raise ValueError(f"Unknown TEXT_ENCODER='{name}'. Available: {available}")
-    preset = TEXT_ENCODER_PRESETS[name]
-    target_cls = resolve_target(preset["target"])
-    if fp32:
-        preset["kwargs"]["dtype"] = "float32"
-    return target_cls(**preset["kwargs"])
+    config = build_text_encoder_config(name, fp32=fp32)
+    target_cls = resolve_target(config.pop("_target_"))
+    return target_cls(**config)
 
 
 def parse_args():
@@ -95,7 +80,7 @@ def main():
     theme, css = get_gradio_theme()
     os.makedirs(args.tmp_folder, exist_ok=True)
     text_encoder = _build_text_encoder(args.text_encoder, args.fp32)
-    display_name = TEXT_ENCODER_PRESETS[args.text_encoder]["display_name"]
+    display_name = args.text_encoder
     demo_wrapper_fn = DemoWrapper(text_encoder, args.tmp_folder)
 
     with gr.Blocks(title="Text encoder", css=css, theme=theme) as demo:

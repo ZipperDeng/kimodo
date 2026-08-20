@@ -1,0 +1,88 @@
+# Reproduction-oriented defaults from Kimodo technical report section 4.3.
+
+model:
+  _target_: kimodo.model.Kimodo
+  num_base_steps: 1000
+  cfg_type: separated
+  denoiser:
+    _target_: kimodo.model.twostage_denoiser.TwostageDenoiser
+    ckpt_path: null
+    motion_mask_mode: concat
+    motion_rep:
+      _target_: kimodo.motion_rep.KimodoMotionRep
+      fps: 30
+      stats_path: null  # Injected from <dataset-root>/stats/motion by kimodo_train.
+      skeleton:
+        _target_: kimodo.skeleton.SOMASkeleton30
+    llm_shape: [1, 4096]
+    use_text_mask: false
+    latent_dim: 1024
+    ff_size: 2048
+    num_layers: 16
+    num_heads: 8
+    activation: gelu
+    # The training loop switches all dropout modules from 0.1 in phase one to
+    # zero in phase two.  These construction defaults match phase one.
+    dropout: 0.1
+    pe_dropout: 0.1
+    norm_first: false
+    num_text_tokens_override: 50
+    input_first_heading_angle: true
+
+training:
+  seed: 42
+  total_steps: 1000000
+  phase1_steps: 500000
+  batch_size: 1  # smoke-test per-process default
+  gradient_accumulation: 1
+  expected_global_batch_size: 2048
+  max_frames: 300
+  num_workers: 4
+  learning_rate: 2.0e-5
+  weight_decay: 0.0
+  gradient_clip: 1.0
+  precision: bf16
+  text_dropout: 0.1
+  phase1_dropout: 0.1
+  phase2_dropout: 0.0
+  constraints:
+    no_constraint_probability: 0.10
+    mixed_constraint_probability: 0.25
+    max_sparse_keyframes: 20
+  ema:
+    enabled: true
+    decay: 0.995
+    update_every: 10
+  include_mirrored: true
+  temporal_probability: 0.5
+  # Used by --dataset-root. Keep the 8B frozen encoder on CPU so GPU memory
+  # remains available to the denoiser; a running TextEncoderAPI may be used instead.
+  text_encoder:
+    _target_: kimodo.model.LLM2VecEncoder
+    base_model_name_or_path: McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp
+    peft_model_name_or_path: McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised
+    dtype: bfloat16
+    llm_dim: 4096
+    device: cpu
+  # To train a multilingual model, use `kimodo_cache_text --text-encoder
+  # bge-m3` and `kimodo_train --text-encoder bge-m3`. The CLI switches
+  # denoiser.llm_shape from 4096 to BGE-M3's 1024 dimensions and records the
+  # model provenance in text-model.json.
+  log_every: 10
+  save_every: 10000
+  keep_checkpoints: 3
+  logging:
+    # JSONL is always dependency-free. Add tensorboard and/or wandb after
+    # installing `pip install -e .[train]`.
+    backends: [jsonl]
+    project: kimodo
+    run_name: null
+    entity: null
+    group: null
+    tags: [soma, seed]
+  validation:
+    enabled: true
+    every: 2000
+    batch_size: 8
+    max_batches: 32
+    monitor: loss

@@ -1,0 +1,56 @@
+schema_version: 1
+
+# Paths are resolved relative to this config file.
+job_dir: ../runs/benchmark/seed-retrain-step-020000
+suite: ../datasets/kimodo-benchmark/testsuite
+dataset: ../datasets/bones-seed/soma_uniform
+
+model:
+  # A training output folder must contain config.yaml beside this checkpoint.
+  checkpoint: ../runs/kimodo-soma/model-0020000.safetensors
+  name: null
+
+prepare:
+  enabled: false
+  workers: 8
+  overwrite: false
+
+generation:
+  enabled: true
+  # null infers the generator encoder from checkpoint/text-model.json.
+  text_model: null
+  batch_size: 1  # required for exact per-case seed reproducibility
+  num_workers: 4
+  diffusion_steps: 100
+  postprocess: false
+  text_encoder_fp32: true
+
+embedding:
+  enabled: true
+  # This is the evaluator's encoder, intentionally tracked separately from
+  # the generator. Official TMR-SOMA-RP-v1 expects LLM2Vec.
+  text_model: llm2vec
+  model: tmr-soma-rp
+  device: cuda
+  text_encoder_fp32: true
+
+evaluation:
+  enabled: true
+  device: cuda
+
+summary:
+  enabled: true
+  format: terminal
+
+publish:
+  wandb:
+    enabled: false
+    project: kimodo
+    entity: null
+    run_id: null  # set to the training W&B run ID to log on the same timeline
+    name: null
+    step: null    # inferred from model-XXXXXXX.safetensors when omitted
+
+# Explicit environment overrides passed to stage subprocesses. Do not put
+# tokens here; inherit secrets from the worker environment instead.
+environment: {}

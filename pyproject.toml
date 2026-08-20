@@ -39,6 +39,10 @@ demo = [
 soma = [
   "py-soma-x @ git+https://github.com/NVlabs/SOMA-X.git"
 ]
+train = [
+  "tensorboard>=2.14",
+  "wandb>=0.16",
+]
 all = [
   "viser @ git+https://github.com/nv-tlabs/kimodo-viser.git",
   "py-soma-x @ git+https://github.com/NVlabs/SOMA-X.git"
@@ -49,6 +53,11 @@ kimodo_gen = "kimodo.scripts.generate:main"
 kimodo_demo = "kimodo.demo:main"
 kimodo_textencoder = "kimodo.scripts.run_text_encoder_server:main"
 kimodo_convert = "kimodo.scripts.motion_convert:main"
+kimodo_train = "kimodo.scripts.train:main"
+kimodo_stats = "kimodo.scripts.compute_training_stats:main"
+kimodo_prepare_seed = "kimodo.scripts.prepare_seed:main"
+kimodo_cache_text = "kimodo.scripts.cache_text:main"
+kimodo_benchmark_job = "kimodo.scripts.benchmark_job:main"
 
 [tool.setuptools]
 include-package-data = true

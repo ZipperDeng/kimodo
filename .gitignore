@@ -136,6 +136,11 @@ dmypy.json
 *.code-workspace
 /pyrightconfig.json
 wandb/
+*.sqlite
+events.jsonl
+tensorboard/
+/.smoke/
+/runs/
 
 # others
 out

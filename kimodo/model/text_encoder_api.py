@@ -22,6 +22,14 @@ class TextEncoderAPI:
         self.client = Client(url, verbose=False)
         self.device = "cpu"
         self.dtype = torch.float
+        self.url = url
+
+    @property
+    def provenance(self):
+        return {
+            "preset": "remote-api", "implementation": f"{type(self).__module__}.{type(self).__name__}",
+            "url": self.url, "revision": None, "embedding_dim": None,
+        }
 
     def _create_np_random_name(self):
         import uuid

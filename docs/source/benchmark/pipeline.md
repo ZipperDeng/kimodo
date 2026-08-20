@@ -10,6 +10,65 @@ This page describes the full benchmark workflow, which uses scripts in the `benc
 
 This pipeline works off-the-shelf for Kimodo models. To evaluate your own model, step (2) will need to be modified to generate with your custom model and output in the expected npz format.
 
+## Recoverable benchmark jobs
+
+For training and release evaluation, use the job wrapper instead of invoking
+the five scripts manually. It keeps the existing stage implementations but
+adds an immutable manifest, checkpoint SHA-256, suite fingerprint, exclusive
+lock, atomic state transitions, per-stage logs, output-count validation, and
+resume support:
+
+```bash
+kimodo_benchmark_job --config configs/benchmark_job.yaml --dry-run
+kimodo_benchmark_job --config configs/benchmark_job.yaml
+kimodo_benchmark_job --config configs/benchmark_job.yaml --resume
+```
+
+The job directory contains:
+
+```text
+job-manifest.json       # immutable checkpoint/suite/commands/provenance
+job-state.json          # PENDING/RUNNING/FAILED/COMPLETED and stage attempts
+logs/<stage>.log        # combined stdout/stderr for each subprocess
+results/                # generated motions, embeddings, per-case metrics
+summary_rows.json       # final aggregate
+```
+
+If a stage fails, the state records its exception and completed earlier stages
+are not rerun. Fix the external cause and pass `--resume`. To intentionally
+invalidate a stage and every stage after it, use for example:
+
+```bash
+kimodo_benchmark_job --config configs/benchmark_job.yaml \
+  --resume --from-stage embed
+```
+
+`--from-stage` adds `--overwrite` to prepare/generate/embed as appropriate;
+later stage states are invalidated as well. If a machine crash leaves
+`.benchmark.lock`, first confirm that no worker still owns the job and then use
+`--resume --force-unlock`. The displaced lock owner is retained in
+`job-state.json` for auditability.
+
+Changing the checkpoint bytes, suite definitions, or resolved stage commands
+causes resume to fail rather than mixing incompatible results. A local
+checkpoint may be passed as either its training output directory or a specific
+`model-XXXXXXX.safetensors`; the latter is loaded exactly and must have the
+corresponding `config.yaml` beside it.
+
+Optional W&B publishing reads `summary_rows.json`, flattens numeric metrics
+under `benchmark/*`, logs them at the checkpoint step, and uploads the summary
+and manifest as an artifact. Set `publish.wandb.run_id` to the training run ID
+to retain a shared step axis. Benchmark jobs should normally run in a separate
+worker/process from DDP training so generation and TMR do not block all ranks.
+
+The manifest distinguishes `generation_text_model` from
+`evaluator_text_model`. Generation normally infers the preset and resolved
+revision from the checkpoint's `text-model.json`; the embedding stage has an
+explicit `embedding.text_model` setting. Stage outputs additionally contain
+`generation-text-model.json` and `evaluator-text-model.json`, populated from
+the actually loaded encoders. Keep the evaluator fixed when comparing model
+quality: changing TMR's text encoder changes the metric space itself.
+
 ## Prerequisite: Download Motion Data and Metadata
 The benchmark is constructed from motions in the BONES-SEED dataset and our released metadata. Make sure you have downloaded the [BONES-SEED dataset](https://huggingface.co/datasets/bones-studio/seed) along with the metadata for the test suite from HuggingFace at [`nvidia/Kimodo-Motion-Gen-Benchmark`](https://huggingface.co/datasets/nvidia/Kimodo-Motion-Gen-Benchmark). 
 

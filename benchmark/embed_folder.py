@@ -8,6 +8,7 @@ This script recursively embeds generated motions, ground-truth motions, and text
 """
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +17,7 @@ from tqdm import tqdm
 
 from kimodo.meta import parse_prompts_from_meta
 from kimodo.model.load_model import load_model
+from kimodo.model.text_encoder_registry import TEXT_ENCODER_PRESETS
 from kimodo.tools import load_json
 
 
@@ -74,6 +76,10 @@ def main():
         action="store_true",
         help="Uses fp32 for the text encoder rather than default bfloat16.",
     )
+    parser.add_argument(
+        "--text_encoder", choices=sorted(TEXT_ENCODER_PRESETS), default=None,
+        help="Text encoder preset used by the TMR evaluator checkpoint.",
+    )
     args = parser.parse_args()
 
     folder = args.folder.resolve()
@@ -81,7 +87,14 @@ def main():
         raise SystemExit(f"Folder does not exist or is not a directory: {folder}")
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_model(modelname=args.model, device=device, default_family="TMR", text_encoder_fp32=args.text_encoder_fp32)
+    model = load_model(
+        modelname=args.model, device=device, default_family="TMR",
+        text_encoder_fp32=args.text_encoder_fp32, text_encoder_name=args.text_encoder,
+    )
+    provenance = getattr(model.raw_text_encoder, "provenance", {"preset": args.text_encoder or "unknown"})
+    (folder / "evaluator-text-model.json").write_text(
+        json.dumps(provenance, indent=2) + "\n", encoding="utf-8"
+    )
 
     dirs = discover_motion_folders(folder)
     if not dirs:

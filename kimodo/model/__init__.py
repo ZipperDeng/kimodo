@@ -14,12 +14,17 @@ from .loading import (
     load_checkpoint_state_dict,
 )
 from .tmr import TMR
+from .bge_m3 import BGEM3Encoder
+from .text_encoder_registry import TEXT_ENCODER_PRESETS, build_text_encoder_config
 from .twostage_denoiser import TwostageDenoiser
 
 __all__ = [
     "Kimodo",
     "LLM2VecEncoder",
     "TMR",
+    "BGEM3Encoder",
+    "TEXT_ENCODER_PRESETS",
+    "build_text_encoder_config",
     "TwostageDenoiser",
     "load_model",
     "load_checkpoint_state_dict",
