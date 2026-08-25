@@ -24,77 +24,87 @@ bash scripts/setup_env.sh --venv-dir "$HOME/venvs/kimodo"
 source "$HOME/venvs/kimodo/bin/activate"
 ```
 
+### Optional: prepare LLM2Vec without gated Hugging Face access
+
+If the gated `meta-llama/Meta-Llama-3-8B-Instruct` base model is unavailable
+from Hugging Face, download it from ModelScope and map it into the Linux Hugging
+Face cache:
+
+```bash
+pip install modelscope
+
+export HF_HOME="$HOME/.cache/huggingface"
+MODEL_DIR="$HOME/models/Meta-Llama-3-8B-Instruct"
+HF_MODEL_DIR="$HF_HOME/hub/models--meta-llama--Meta-Llama-3-8B-Instruct"
+
+modelscope download \
+  --model LLM-Research/Meta-Llama-3-8B-Instruct \
+  --local_dir "$MODEL_DIR"
+
+mkdir -p "$HF_MODEL_DIR/snapshots" "$HF_MODEL_DIR/refs"
+ln -sfn "$MODEL_DIR" "$HF_MODEL_DIR/snapshots/modelscope"
+printf '%s\n' modelscope > "$HF_MODEL_DIR/refs/main"
+
+# Enable these after the first successful model load.
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+```
+
 ## Prepare data
 
-Data preparation follows one order: convert motion and text, encode the text,
-then compute motion statistics and manifests.
+AssetCMS prepares motion assets and text vectors. Kimodo only computes its
+motion statistics/manifests and consumes the completed dataset.
 
 ### 1. Convert motion and text
 
-#### BONES-SEED (recommended)
+#### Standard dataset layout
 
-The Hugging Face snapshot contains a 42.1 GiB `soma_uniform.tar.gz` plus SEED
-metadata. Convert it to Kimodo's standard motion/text directory layout (the
-command is offline and never writes to the Hugging Face cache):
-
-```bash
-kimodo_prepare_seed --source auto --output /data/dataset-root
-```
-
-Use `kimodo_prepare_seed --source auto --output ... --dry-run` to verify the
-cached revision and archive size without extracting. The output path must be
-new; interrupted extraction is retained as `<output>.extracting` so that a
-large partial result is never silently deleted.
-
-The converter applies a stable 98/1/1 split while keeping each original/`_M`
-mirror pair together, converts SOMA Uniform BVH from 120 fps to Kimodo's 30
-fps NPZ format, preserves all seven overview descriptions as text variants,
-and materializes public NVIDIA temporal labels as atomic sub-clips.
-
-#### Custom datasets
-
-Custom datasets use the same input layout. Motion and text files are paired by
-their relative path and filename stem:
+One root shares semantic data across skeleton representations, while motion-derived
+data is isolated by the skeleton's canonical name:
 
 ```text
 dataset-root/
-├── motions/
-│   ├── train/walk/000001.npz
-│   └── val/walk/000002.npz       # optional validation split
-└── texts/
-    ├── train/walk/000001.txt      # one description
-    ├── train/run/000003/          # or multiple descriptions for one motion
-    │   ├── 00.txt
-    │   └── 01.txt
-    └── val/walk/000002.txt
+├── samples/{train,val,test}.jsonl      # shared annotations and splits
+├── texts/{train,val,test}/**/*.txt     # shared alternative text layout
+├── motion-text-index.json              # vector schema and model provenance
+├── training-vectors/llm2vec/           # published float16 mmap training snapshot
+├── bvh/soma/                           # retained source previews
+└── skeletons/
+    ├── somaskel30/motions/{train,val,test}/**/*.npz
+    └── smplx22/motions/{train,val,test}/**/*.npz
 ```
 
 Each motion NPZ contains `local_rot_mats` (`T,J,3,3`) and `root_positions`
-(`T,3`).
+(`T,3`) at 30 FPS. An optional `source.json` can declare `skeleton`,
+`joint_count`, `fps`, `coordinate_system`, and `units`; statistics and training
+reject incompatible metadata or joint counts.
 
-### 2. Encode text
+Dataset-specific download, extraction, and conversion are intentionally outside
+this repository. Kimodo consumes any producer's completed dataset root through
+the contract above; training code does not import or invoke dataset adapters.
 
-Choose one text encoder and build the cache once. The default is LLM2Vec:
+#### SMPL-X
 
-```bash
-kimodo_cache_text --config configs/train_soma.yaml \
-  --dataset-root /data/dataset-root
-```
+SMPL-X training uses 22 body joints and `configs/train_smplx.yaml`. Convert the
+source motion into the standard layout first, then use the SMPL-X config for
+both statistics and training. `configs/train_smplx_smoke.yaml` provides the
+four-step pipeline check.
 
-The command mirrors every `.txt` into `embeddings/` as a float16 `.npy` and
-writes `text-model.json`. The frozen encoder is kept on CPU by default; set
-`training.text_encoder` to `kimodo.model.TextEncoderAPI` with a `url` to use a
-separately hosted encoder service.
+### 2. Prepare text vectors in AssetCMS
+
+Kimodo no longer contains a text-cache producer. AssetCMS owns deduplication,
+encoding, indexing, provenance, and publishing. Existing LLM2Vec data can be
+migrated without running the 8B model again; consult AssetCMS motion processing
+documentation. Kimodo accepts only the published float16 mmap snapshot at
+`training-vectors/<encoder>/` and never connects to the producer's vector
+database or loads a frozen text encoder during training. mmap supports normal
+multi-worker DataLoaders and shares the operating-system page cache across
+workers and distributed training processes.
 
 #### Optional: BGE-M3 multilingual conditioning
 
-To create a new multilingual model family, use BGE-M3 instead of the default
-encoder when building the cache:
-
-```bash
-kimodo_cache_text --config configs/train_soma.yaml \
-  --dataset-root /data/dataset-root --text-encoder bge-m3
-```
+To create a new multilingual model family, incrementally add BGE-M3 to the
+AssetCMS collection, then select it with `kimodo_train --text-encoder bge-m3`.
 
 BGE-M3 uses one normalized 1024-dimensional CLS embedding token and does not
 require a query instruction. Add `--text-encoder bge-m3` to the training command
@@ -109,7 +119,7 @@ controlled comparison. Using BGE-M3 inside TMR itself requires retraining TMR.
 
 ### 3. Compute motion statistics and manifests
 
-After text embedding is complete, compute normalization statistics from the
+After AssetCMS preparation is complete, compute normalization statistics from the
 training split and generate the dataset manifests:
 
 ```bash
@@ -117,27 +127,35 @@ kimodo_stats --config configs/train_soma.yaml \
   --dataset-root /data/dataset-root
 ```
 
+The command uses CPU with a batch size of 8 and four parallel statistics
+workers. Each worker computes local sufficient statistics and the parent
+process merges them. Use `--batch-size` or `--num-workers` only when the
+machine requires different values.
+
 The statistics are tied to the dataset, skeleton, frame rate, crop length, and
 feature conversion, so rerun this step when any of them changes. After all
 three preparation steps, the directory is:
 
 ```text
 dataset-root/
-├── motions/{train,val,test}/**/*.npz
-├── texts/{train,val,test}/**/*.txt
-├── embeddings/{train,val,test}/**/*.npy
-├── train.jsonl
-├── val.jsonl                         # only when a validation split exists
-├── dataset.json
-├── text-model.json
-└── stats/motion/
-    ├── global_root/{mean,std}.npy
-    ├── local_root/{mean,std}.npy
-    └── body/{mean,std}.npy
+├── texts/{train,val,test}/**/*.txt    # custom directory datasets
+├── samples/{train,val,test}.jsonl     # optional catalog and temporal slices
+├── motion-text-index.json             # shared vector contract
+├── training-vectors/llm2vec/          # mmap snapshot used by training
+└── skeletons/somaskel30/
+    ├── motions/{train,val,test}/**/*.npz
+    ├── train.jsonl
+    ├── val.jsonl                      # only when validation exists
+    ├── dataset.json
+    └── stats/motion/
+        ├── global_root/{mean,std}.npy
+        ├── local_root/{mean,std}.npy
+        └── body/{mean,std}.npy
 ```
 
 The generated embeddings, manifests, metadata, and statistics do not need to
-be edited.
+be edited. Both `kimodo_stats` and `kimodo_train` select the skeleton subdirectory
+from the config, so `--dataset-root` always points at the shared root.
 
 ## Run
 
@@ -147,13 +165,26 @@ Train the prepared dataset root:
 kimodo_train --config configs/train_soma.yaml \
   --dataset-root /data/dataset-root --output runs/kimodo-soma
 
-torchrun --nproc_per_node=8 -m kimodo.scripts.train \
+torchrun --nproc_per_node=4 -m kimodo.scripts.train \
   --config configs/train_soma.yaml --dataset-root /data/dataset-root \
   --output runs/kimodo-soma
 ```
 
-The training loop implements 500k text-only optimizer steps followed by 500k
-constraint-curriculum optimizer steps, 30 fps / 300 frame crops, 1000 diffusion
+Before a long run, exercise the complete pipeline with the small single-device
+configuration (four batch steps across both curriculum phases):
+
+```bash
+kimodo_train --config configs/train_smoke.yaml \
+  --dataset-root /data/dataset-root --output runs/kimodo-smoke
+```
+
+This configuration is intentionally not architecture-compatible with released
+checkpoints and its metrics are not meaningful; it validates data loading,
+SQLite embeddings, forward/backward, validation, EMA, logging, and checkpoint
+writing.
+
+The training loop implements 500k text-only global batch steps followed by 500k
+constraint-curriculum global batch steps, 30 fps / 300 frame crops, 1000 diffusion
 steps, Adam-atan2 at `2e-5`, random initial headings, and the seven weighted
 Smooth-L1 terms reported in the paper. During phase two, 10% of samples remain
 text-only, 25% mix two constraint families, and the sparse-keyframe limit grows
@@ -162,10 +193,10 @@ dropout changes from 0.1 to zero at the phase boundary. Text dropout is sampled
 independently per item.
 
 The final `model.safetensors` contains the EMA weights used for inference
-(decay 0.995, updated every 10 optimizer steps). `training-state.pt` separately
+(decay 0.995, updated every 10 batch steps). `training-state.pt` separately
 stores raw weights, EMA, optimizer, mixed-precision scaler, RNG state, epoch,
-micro-step, and optimizer-step counters for resume. Gradient accumulation and
-curriculum progress are defined in optimizer steps, not dataloader micro-steps.
+micro-batch-step and global-batch-step counters for resume. One batch step
+consumes `expected_global_batch_size` samples and performs one parameter update.
 Single-process resume restores the exact saved RNG streams. Distributed resume
 re-seeds each rank independently because the rank-zero state file does not
 contain every worker's RNG stream.
@@ -174,7 +205,7 @@ contain every worker's RNG stream.
 
 Every rank-zero run writes `events.jsonl`, `run-metadata.json`, and an exact
 `training-config.yaml` under the output directory. JSONL records training loss
-components, learning rate, gradient norm, throughput, step time, AMP loss
+components, learning rate, gradient norm, throughput, batch-step time, AMP loss
 scale, phase, epoch, and CUDA allocated/reserved memory. Non-finite loss or
 gradient norm terminates training immediately. A new run refuses to overwrite
 an output containing `training-state.pt`; continuation requires `--resume`.
@@ -203,7 +234,7 @@ parameters:
 training:
   validation:
     enabled: true
-    every: 2000
+    every_batch_steps: 2000
     batch_size: 8
     max_batches: 32
     monitor: loss
@@ -220,10 +251,14 @@ Run the documented `benchmark/` pipeline on saved checkpoints at a lower
 frequency (for example every 20k--50k steps); do not use training loss as a
 replacement for those generation metrics.
 
-`configs/train_soma.yaml` deliberately uses a per-process batch size of one as
-a safe smoke-test default. At startup the trainer prints the effective global
-batch (`per_device * world_size * accumulation`) and warns when it differs from
-the report's 2048. Adjust batch size and accumulation for production runs.
+`configs/train_soma.yaml` targets the report's 4-GPU global batch of 512 using
+a conservative 48 GiB starting point of 16 samples per GPU. Users do not set
+gradient accumulation: the trainer derives it as
+`expected_global_batch_size / (batch_size * WORLD_SIZE)`. This gives 8 on four
+GPUs and 32 on one GPU. The target must divide the distributed micro-batch
+exactly or startup fails. Profile representative 300-frame batches before a
+long run; increasing `batch_size` to 32 on four GPUs automatically reduces
+accumulation to 4 while preserving the same global batch.
 
 The Bones Rigplay data, transition-generated stitched augmentation, and
 NVIDIA's exact data-mixture distribution are not public;

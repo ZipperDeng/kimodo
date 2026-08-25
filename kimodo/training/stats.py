@@ -15,9 +15,15 @@ class RunningMoments:
         selected = values.detach()[valid].double().cpu()
         if not len(selected):
             return
-        self.count += len(selected)
-        self.sum += selected.sum(dim=0)
-        self.sum_squares += selected.square().sum(dim=0)
+        self.merge(len(selected), selected.sum(dim=0), selected.square().sum(dim=0))
+
+    def merge(self, count: int, total: torch.Tensor, total_squares: torch.Tensor) -> None:
+        """Merge sufficient statistics computed by another process."""
+        if not count:
+            return
+        self.count += int(count)
+        self.sum += total.detach().double().cpu()
+        self.sum_squares += total_squares.detach().double().cpu()
 
     def compute(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.count == 0:

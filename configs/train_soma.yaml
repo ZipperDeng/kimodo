@@ -31,11 +31,13 @@ model:
 
 training:
   seed: 42
-  total_steps: 1000000
-  phase1_steps: 500000
-  batch_size: 1  # smoke-test per-process default
-  gradient_accumulation: 1
-  expected_global_batch_size: 2048
+  # One batch step consumes expected_global_batch_size samples and performs
+  # one optimizer update. The trainer derives gradient accumulation from the
+  # torchrun WORLD_SIZE and this per-GPU micro-batch size.
+  total_batch_steps: 1000000
+  phase1_batch_steps: 500000
+  batch_size: 16
+  expected_global_batch_size: 512
   max_frames: 300
   num_workers: 4
   learning_rate: 2.0e-5
@@ -52,9 +54,7 @@ training:
   ema:
     enabled: true
     decay: 0.995
-    update_every: 10
-  include_mirrored: true
-  temporal_probability: 0.5
+    update_every_batch_steps: 10
   # Used by --dataset-root. Keep the 8B frozen encoder on CPU so GPU memory
   # remains available to the denoiser; a running TextEncoderAPI may be used instead.
   text_encoder:
@@ -64,12 +64,10 @@ training:
     dtype: bfloat16
     llm_dim: 4096
     device: cpu
-  # To train a multilingual model, use `kimodo_cache_text --text-encoder
-  # bge-m3` and `kimodo_train --text-encoder bge-m3`. The CLI switches
-  # denoiser.llm_shape from 4096 to BGE-M3's 1024 dimensions and records the
-  # model provenance in text-model.json.
-  log_every: 10
-  save_every: 10000
+  # AssetCMS owns and publishes offline mmap text vectors. `kimodo_train
+  # --text-encoder bge-m3` selects that snapshot and switches the dimension to 1024.
+  log_every_batch_steps: 10
+  save_every_batch_steps: 10000
   keep_checkpoints: 3
   logging:
     # JSONL is always dependency-free. Add tensorboard and/or wandb after
@@ -82,7 +80,7 @@ training:
     tags: [soma, seed]
   validation:
     enabled: true
-    every: 2000
+    every_batch_steps: 2000
     batch_size: 8
     max_batches: 32
     monitor: loss

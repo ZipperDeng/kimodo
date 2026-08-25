@@ -87,7 +87,7 @@ class ExperimentLogger:
                 config=OmegaConf.to_container(config, resolve=True),
             )
 
-    def log(self, metrics: dict, step: int, event="train"):
+    def log(self, metrics: dict, batch_step: int, event="train"):
         values = {}
         for key, value in metrics.items():
             if isinstance(value, torch.Tensor):
@@ -97,7 +97,7 @@ class ExperimentLogger:
         record = {
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "event": event,
-            "step": int(step),
+            "batch_step": int(batch_step),
             **values,
         }
         self.stream.write(json.dumps(record, allow_nan=False) + "\n")
@@ -105,9 +105,9 @@ class ExperimentLogger:
         scalars = {key: value for key, value in values.items() if isinstance(value, (int, float, bool))}
         if self.tensorboard:
             for key, value in scalars.items():
-                self.tensorboard.add_scalar(f"{event}/{key}", value, step)
+                self.tensorboard.add_scalar(f"{event}/{key}", value, batch_step)
         if self.wandb:
-            self.wandb.log({f"{event}/{key}": value for key, value in scalars.items()}, step=step)
+            self.wandb.log({f"{event}/{key}": value for key, value in scalars.items()}, step=batch_step)
 
     def close(self):
         if self.stream.closed:

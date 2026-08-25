@@ -1,0 +1,75 @@
+# Small SMPL-X pipeline smoke test; metrics are not meaningful.
+
+model:
+  _target_: kimodo.model.Kimodo
+  num_base_steps: 1000
+  cfg_type: separated
+  denoiser:
+    _target_: kimodo.model.twostage_denoiser.TwostageDenoiser
+    ckpt_path: null
+    motion_mask_mode: concat
+    motion_rep:
+      _target_: kimodo.motion_rep.KimodoMotionRep
+      fps: 30
+      stats_path: null
+      skeleton:
+        _target_: kimodo.skeleton.SMPLXSkeleton22
+    llm_shape: [1, 4096]
+    use_text_mask: false
+    latent_dim: 128
+    ff_size: 256
+    num_layers: 2
+    num_heads: 4
+    activation: gelu
+    dropout: 0.1
+    pe_dropout: 0.1
+    norm_first: false
+    num_text_tokens_override: 4
+    input_first_heading_angle: true
+
+training:
+  seed: 42
+  total_batch_steps: 4
+  phase1_batch_steps: 2
+  batch_size: 1
+  expected_global_batch_size: 1
+  max_frames: 32
+  num_workers: 0
+  learning_rate: 2.0e-5
+  weight_decay: 0.0
+  gradient_clip: 1.0
+  precision: bf16
+  text_dropout: 0.1
+  phase1_dropout: 0.1
+  phase2_dropout: 0.0
+  constraints:
+    no_constraint_probability: 0.10
+    mixed_constraint_probability: 0.25
+    max_sparse_keyframes: 4
+  ema:
+    enabled: true
+    decay: 0.995
+    update_every_batch_steps: 1
+  text_encoder:
+    _target_: kimodo.model.LLM2VecEncoder
+    base_model_name_or_path: McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp
+    peft_model_name_or_path: McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised
+    dtype: bfloat16
+    llm_dim: 4096
+    device: cpu
+  log_every_batch_steps: 1
+  save_every_batch_steps: 2
+  keep_checkpoints: 2
+  logging:
+    backends: [jsonl]
+    project: kimodo
+    run_name: smplx-smoke
+    entity: null
+    group: smoke
+    tags: [smoke, smplx]
+  validation:
+    enabled: true
+    every_batch_steps: 2
+    batch_size: 1
+    max_batches: 1
+    monitor: loss

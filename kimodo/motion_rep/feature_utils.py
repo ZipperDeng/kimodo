@@ -187,11 +187,17 @@ class RotateFeatures:
 
     def rotate_positions(self, positions: torch.Tensor):
         """Rotate 3D positions around the Y axis."""
-        return positions @ self.corrective_mat_Y_T
+        matrix = self.corrective_mat_Y_T
+        while matrix.ndim < positions.ndim:
+            matrix = matrix.unsqueeze(-3)
+        return positions @ matrix
 
     def rotate_2d_positions(self, positions_2d: torch.Tensor):
         """Rotate 2D ``(x, z)`` vectors in the ground plane."""
-        return positions_2d @ self.corrective_mat_2d_T
+        matrix = self.corrective_mat_2d_T
+        while matrix.ndim < positions_2d.ndim:
+            matrix = matrix.unsqueeze(-3)
+        return positions_2d @ matrix
 
     def rotate_rotations(self, rotations: torch.Tensor):
         """Left-multiply global rotation matrices by the heading correction."""

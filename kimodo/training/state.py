@@ -9,6 +9,37 @@ from torch import nn
 from contextlib import contextmanager
 
 
+def compute_gradient_accumulation(
+    per_device_batch_size: int,
+    world_size: int,
+    expected_global_batch_size: int,
+) -> int:
+    """Derive micro-batch accumulation needed for one global batch step."""
+    per_device_batch_size = int(per_device_batch_size)
+    world_size = int(world_size)
+    expected_global_batch_size = int(expected_global_batch_size)
+    if per_device_batch_size < 1:
+        raise ValueError("training.batch_size must be at least one")
+    if world_size < 1:
+        raise ValueError("WORLD_SIZE must be at least one")
+    if expected_global_batch_size < 1:
+        raise ValueError("training.expected_global_batch_size must be at least one")
+    global_micro_batch = per_device_batch_size * world_size
+    if expected_global_batch_size < global_micro_batch:
+        raise ValueError(
+            f"Target global batch {expected_global_batch_size} is smaller than one distributed "
+            f"micro-batch ({per_device_batch_size} per GPU x {world_size} processes = "
+            f"{global_micro_batch}). Reduce training.batch_size or increase the target."
+        )
+    if expected_global_batch_size % global_micro_batch:
+        raise ValueError(
+            f"Target global batch {expected_global_batch_size} is not divisible by one distributed "
+            f"micro-batch ({global_micro_batch}). Choose values where "
+            "expected_global_batch_size % (batch_size * WORLD_SIZE) == 0."
+        )
+    return expected_global_batch_size // global_micro_batch
+
+
 class ExponentialMovingAverage:
     """Maintain an fp32 exponential moving average of model parameters."""
 
