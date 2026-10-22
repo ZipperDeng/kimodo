@@ -16,7 +16,6 @@ import json
 import math
 import os
 import random
-import shutil
 import time
 from pathlib import Path
 
@@ -39,13 +38,17 @@ from kimodo.training import (
     AdamAtan2,
     ExponentialMovingAverage,
     ExperimentLogger,
+    ProgressReporter,
     KimodoLoss,
     MotionDataset,
     capture_rng_state,
     collate_motion_batch,
     compute_gradient_accumulation,
+    compute_motion_stats,
     restore_rng_state,
+    read_release_manifest,
     read_text_vector_metadata,
+    save_motion_stats,
     skeleton_dataset_root,
     set_dropout_probability,
     write_run_metadata,
@@ -60,7 +63,7 @@ def arguments():
     parser.add_argument(
         "--dataset-root",
         required=True,
-        help="Prepared Kimodo motion/text dataset directory",
+        help="AssetCMS release directory (library/releases/<release>)",
     )
     parser.add_argument("--output", required=True)
     parser.add_argument("--resume", help="Path to a training-state .pt file")
@@ -92,7 +95,7 @@ def _text_embeddings_to_device(text, text_mask, device):
     if not isinstance(text, torch.Tensor) or not isinstance(text_mask, torch.Tensor):
         raise TypeError(
             "Training requires tensor text vectors from an AssetCMS mmap snapshot; "
-            "publish the selected encoder and then run kimodo_stats."
+            "publish a release with the selected encoder."
         )
     return text.to(device), text_mask.to(device)
 
@@ -113,13 +116,15 @@ def evaluate_validation(
         np.random.seed(seed)
         with torch.random.fork_rng(devices=cuda_devices):
             torch.manual_seed(seed)
-            for batch_index, (rotations, roots, lengths, valid, text, text_mask) in enumerate(loader):
+            for batch_index, (rotations, roots, lengths, valid, text, text_mask, smooth_roots) in enumerate(loader):
                 if batch_index >= max_batches:
                     break
                 rotations, roots = rotations.to(device), roots.to(device)
                 lengths, valid = lengths.to(device), valid.to(device)
                 text, text_mask = _text_embeddings_to_device(text, text_mask, device)
-                clean = motion_rep(rotations, roots, to_normalize=False, lengths=lengths)
+                clean = motion_rep(
+                    rotations, roots, to_normalize=False, lengths=lengths, smooth_root_pos=smooth_roots.to(device)
+                )
                 clean = motion_rep.translate_2d_to_zero(clean)
                 clean = motion_rep.normalize(clean)
                 first_heading = motion_rep.get_root_heading_angle(motion_rep.unnormalize(clean))[:, 0]
@@ -247,6 +252,7 @@ def main():
         )
     configured_text_model = text_encoder_provenance_from_config(cfg.training.text_encoder)
     text_encoder_name = args.text_encoder or configured_text_model.get("preset", "llm2vec")
+    read_release_manifest(dataset_root)
     _index_metadata, text_model = read_text_vector_metadata(dataset_root, text_encoder_name)
     logger = None
     if rank == 0:
@@ -271,13 +277,50 @@ def main():
     # all derived paths select one variant below the shared dataset root.
     skeleton_probe = instantiate(cfg.model.denoiser.motion_rep.skeleton)
     variant_root = skeleton_dataset_root(dataset_root, skeleton_probe.name)
-    motion_stats_dir = variant_root / "stats" / "motion"
+    validate_dataset_contract(dataset_root, skeleton_probe, float(cfg.model.denoiser.motion_rep.fps))
+    # Datasets are built before the model so malformed releases fail fast and
+    # normalization statistics can be computed from the training split.
+    train_manifest = variant_root / "train.jsonl"
+    if not train_manifest.is_file():
+        raise FileNotFoundError(f"Missing release manifest: {train_manifest}. Publish the skeleton with AssetCMS.")
+    dataset = MotionDataset(
+        train_manifest,
+        text_encoder=text_encoder_name,
+        expected_joints=skeleton_probe.nbjoints,
+    )
+    val_manifest = variant_root / "val.jsonl"
+    validation_dataset = (
+        MotionDataset(
+            val_manifest,
+            text_encoder=text_encoder_name,
+            expected_joints=skeleton_probe.nbjoints,
+        )
+        if val_manifest.is_file() else None
+    )
+    # Statistics belong to the run: computed once into the output directory,
+    # exported with every checkpoint, and reused on resume.
+    motion_stats_dir = output / "stats" / "motion"
     if not motion_stats_dir.is_dir():
-        raise FileNotFoundError(f"Missing motion statistics: {motion_stats_dir}. Run kimodo_stats first.")
-    if rank == 0:
-        output_stats = output / "stats" / "motion"
-        if motion_stats_dir.is_dir() and not output_stats.exists():
-            shutil.copytree(motion_stats_dir, output_stats)
+        if args.resume:
+            raise FileNotFoundError(f"Cannot resume without the run's motion statistics: {motion_stats_dir}")
+        stats_rep_cfg = OmegaConf.create(OmegaConf.to_container(cfg.model.denoiser.motion_rep, resolve=False))
+        with open_dict(stats_rep_cfg):
+            stats_rep_cfg.stats_path = None
+        stats_rep = instantiate(stats_rep_cfg)
+        stats_rep.skeleton.to(device)
+        stats_cfg = cfg.training.get("stats", {})
+        moments = compute_motion_stats(
+            dataset,
+            stats_rep,
+            device,
+            max_samples=int(stats_cfg.get("max_samples", 50000)),
+            batch_size=int(stats_cfg.get("batch_size", 64)),
+            num_workers=int(cfg.training.num_workers),
+            max_frames=int(cfg.training.max_frames),
+            seed=int(cfg.training.seed),
+        )
+        if rank == 0:
+            save_motion_stats(motion_stats_dir, moments)
     if world > 1:
         dist.barrier()
     model_cfg = OmegaConf.create(OmegaConf.to_container(cfg.model, resolve=False))
@@ -295,7 +338,6 @@ def main():
             )
     denoiser = instantiate(model_cfg.denoiser).to(device)
     motion_rep = denoiser.motion_rep
-    validate_dataset_contract(dataset_root, motion_rep.skeleton, motion_rep.fps)
     diffusion = Diffusion(int(model_cfg.num_base_steps)).to(device)
     objective = KimodoLoss(motion_rep)
     optimizer = AdamAtan2(
@@ -334,23 +376,6 @@ def main():
             device_ids=[device.index] if device.type == "cuda" else None,
         )
 
-    train_manifest = variant_root / "train.jsonl"
-    if not train_manifest.is_file():
-        raise FileNotFoundError(f"Missing generated manifest: {train_manifest}. Run kimodo_stats first.")
-    dataset = MotionDataset(
-        train_manifest,
-        text_encoder=text_encoder_name,
-        expected_joints=motion_rep.nbjoints,
-    )
-    val_manifest = variant_root / "val.jsonl"
-    validation_dataset = (
-        MotionDataset(
-            val_manifest,
-            text_encoder=text_encoder_name,
-            expected_joints=motion_rep.nbjoints,
-        )
-        if val_manifest.is_file() else None
-    )
     sampler = DistributedSampler(dataset, shuffle=True) if world > 1 else None
     collate = functools.partial(collate_motion_batch, max_frames=int(cfg.training.max_frames))
     num_workers = int(cfg.training.num_workers)
@@ -376,6 +401,8 @@ def main():
         scaler.load_state_dict(state["scaler"])
     amp_dtype = torch.bfloat16 if cfg.training.precision == "bf16" else torch.float16
     global_batch = int(cfg.training.batch_size) * world * accumulation
+    total_steps = int(cfg.training.total_batch_steps)
+    reporter = None
     if rank == 0:
         startup = {
             "global_batch_size": global_batch,
@@ -388,22 +415,37 @@ def main():
             "text_model": text_model.get("preset") if text_model else None,
             "text_embedding_dim": text_model.get("embedding_dim") if text_model else None,
         }
-        print(json.dumps(startup))
         logger.log(startup, batch_step, event="run")
+        reporter = ProgressReporter(total_steps, batch_step, global_batch)
+        reporter.banner([
+            f"Kimodo training | release {read_release_manifest(dataset_root)['release']} | "
+            f"{skeleton_probe.name} | {startup['text_model']} {startup['text_embedding_dim']}-d text",
+            f"data: {startup['train_samples']:,} train / {startup['validation_samples']:,} validation samples",
+            f"model: {startup['parameters'] / 1e6:.1f}M parameters | {cfg.training.precision} | "
+            f"{world} GPU x {int(cfg.training.batch_size)} x accumulation {accumulation} = global batch {global_batch}",
+            f"schedule: {total_steps:,} steps, phase 2 from {int(cfg.training.phase1_batch_steps):,} | "
+            f"log every {int(cfg.training.log_every_batch_steps)} steps | output {output}",
+            f"resuming from step {batch_step:,}" if args.resume else "starting from step 0",
+        ])
     epoch = start_epoch
     optimizer.zero_grad(set_to_none=True)
     active_phase = None
-    last_log_time = time.perf_counter()
-    last_log_step = batch_step
-    while batch_step < int(cfg.training.total_batch_steps):
+    # Per-log-window sums kept on the device, so logging needs no per-step sync;
+    # they are reduced across ranks only when a log line is written.
+    window_sums, window_micro_batches, window_gradient_norm, window_data_wait = {}, 0, None, 0.0
+    fetch_started = time.perf_counter()
+    while batch_step < total_steps:
         if sampler is not None:
             sampler.set_epoch(epoch)
-        for rotations, roots, lengths, valid, text, text_mask in loader:
+        for rotations, roots, lengths, valid, text, text_mask, smooth_roots in loader:
+            window_data_wait += time.perf_counter() - fetch_started
             rotations, roots = rotations.to(device), roots.to(device)
             lengths, valid = lengths.to(device), valid.to(device)
             text, text_mask = _text_embeddings_to_device(text, text_mask, device)
             with torch.no_grad():
-                clean = motion_rep(rotations, roots, to_normalize=False, lengths=lengths)
+                clean = motion_rep(
+                    rotations, roots, to_normalize=False, lengths=lengths, smooth_root_pos=smooth_roots.to(device)
+                )
                 clean = motion_rep.translate_2d_to_zero(clean)
                 headings = torch.rand(len(clean), device=device) * (2 * math.pi)
                 clean = motion_rep.rotate_to(clean, headings)
@@ -417,7 +459,9 @@ def main():
                     set_dropout_probability(raw, float(dropout))
                     active_phase = phase
                     if rank == 0:
-                        print(json.dumps({"batch_step": batch_step, "phase": phase, "dropout": float(dropout)}))
+                        description = "text-only" if phase == 1 else "constraint curriculum"
+                        reporter.message(f"phase {phase} ({description}) from step {batch_step:,}, dropout {float(dropout)}")
+                        logger.log({"phase": phase, "dropout": float(dropout)}, batch_step, event="phase")
                 if phase == 2:
                     phase2_steps = max(
                         1,
@@ -460,6 +504,9 @@ def main():
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"Non-finite loss at batch step {batch_step}: {float(loss)}")
                 scaler.scale(scaled_loss).backward()
+            for name, value in (("loss", loss), *components.items()):
+                window_sums[name] = window_sums.get(name, 0.0) + value.detach().float()
+            window_micro_batches += 1
             micro_batch_step += 1
             if completes_update:
                 scaler.unscale_(optimizer)
@@ -470,33 +517,46 @@ def main():
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 batch_step += 1
+                window_gradient_norm = grad_norm.detach().float() + (
+                    window_gradient_norm if window_gradient_norm is not None else 0.0
+                )
                 if ema is not None and batch_step % int(cfg.training.ema.update_every_batch_steps) == 0:
                     ema.update(raw)
-                if rank == 0 and batch_step % int(cfg.training.log_every_batch_steps) == 0:
-                    now = time.perf_counter()
-                    elapsed = max(now - last_log_time, 1e-9)
-                    steps_since_log = batch_step - last_log_step
-                    values = {key: float(value.detach()) for key, value in components.items()}
-                    metrics = {
-                        "loss": float(loss.detach()),
-                        **values,
-                        "learning_rate": float(optimizer.param_groups[0]["lr"]),
-                        "gradient_norm": float(grad_norm),
-                        "samples_per_second": steps_since_log * global_batch / elapsed,
-                        "seconds_per_batch_step": elapsed / max(steps_since_log, 1),
-                        "epoch": epoch,
-                        "phase": active_phase,
-                        "loss_scale": float(scaler.get_scale()),
-                    }
-                    if device.type == "cuda":
-                        metrics["gpu_memory_allocated_gib"] = torch.cuda.memory_allocated(device) / 2**30
-                        metrics["gpu_memory_reserved_gib"] = torch.cuda.memory_reserved(device) / 2**30
-                    print(
-                        json.dumps({"batch_step": batch_step, **{k: round(v, 5) if isinstance(v, float) else v for k, v in metrics.items()}}),
-                        flush=True,
-                    )
-                    logger.log(metrics, batch_step)
-                    last_log_time, last_log_step = now, batch_step
+                if batch_step % int(cfg.training.log_every_batch_steps) == 0:
+                    # Every rank joins the reduction; rank 0 reports window means.
+                    names = list(window_sums)
+                    packed = torch.stack([
+                        *(window_sums[name] for name in names),
+                        window_gradient_norm,
+                        torch.tensor(window_data_wait, device=device),
+                        torch.tensor(float(window_micro_batches), device=device),
+                    ])
+                    if world > 1:
+                        dist.all_reduce(packed)
+                    packed = packed.tolist()
+                    micro_batches, data_wait = packed[-1], packed[-2] / world
+                    # Gradient norms are identical on every rank; average over all updates.
+                    updates = micro_batches / accumulation
+                    means = {name: value / micro_batches for name, value in zip(names, packed)}
+                    if rank == 0:
+                        timing = reporter.timing(batch_step)
+                        metrics = {
+                            "loss": means.pop("loss"),
+                            **means,
+                            "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                            "gradient_norm": packed[-3] / updates,
+                            **timing,
+                            "data_wait_fraction": min(data_wait / max(timing["interval_seconds"], 1e-9), 1.0),
+                            "epoch": epoch,
+                            "phase": active_phase,
+                            "loss_scale": float(scaler.get_scale()),
+                        }
+                        if device.type == "cuda":
+                            metrics["gpu_memory_allocated_gib"] = torch.cuda.memory_allocated(device) / 2**30
+                            metrics["gpu_memory_reserved_gib"] = torch.cuda.memory_reserved(device) / 2**30
+                        reporter.step(batch_step, {**metrics, "components": means})
+                        logger.log(metrics, batch_step)
+                    window_sums, window_micro_batches, window_gradient_norm, window_data_wait = {}, 0, None, 0.0
                 validation_every = int(validation_cfg.get("every_batch_steps", 0))
                 validation_due = validation_loader is not None and validation_every > 0 and batch_step % validation_every == 0
                 if validation_due:
@@ -512,20 +572,21 @@ def main():
                                 int(cfg.training.seed) + 100000,
                             )
                         logger.log(validation_metrics, batch_step, event="validation")
-                        print(json.dumps({"batch_step": batch_step, "validation": validation_metrics}), flush=True)
                         monitor_name = str(validation_cfg.get("monitor", "loss"))
                         if monitor_name not in validation_metrics:
                             raise KeyError(
                                 f"validation.monitor={monitor_name!r} is not one of {sorted(validation_metrics)}"
                             )
                         monitored = float(validation_metrics[monitor_name])
-                        if monitored < best_metric:
+                        improved = monitored < best_metric
+                        if improved:
                             best_metric = monitored
                             save_checkpoint(
                                 output, denoiser, optimizer, scaler, ema, batch_step, micro_batch_step,
                                 epoch, cfg, best=True, best_metric=best_metric,
                             )
                             logger.log({"metric": best_metric}, batch_step, event="best_checkpoint")
+                        reporter.validation(batch_step, validation_metrics, best_metric, monitor_name, improved)
                     if world > 1:
                         dist.barrier()
                 if rank == 0 and batch_step % int(cfg.training.save_every_batch_steps) == 0:
@@ -535,14 +596,17 @@ def main():
                     )
                     prune_periodic_checkpoints(output, int(cfg.training.get("keep_checkpoints", 3)))
                     logger.log({"path": str(path)}, batch_step, event="checkpoint")
-            if batch_step >= int(cfg.training.total_batch_steps):
+                    reporter.message(f"checkpoint saved: {Path(path).name}")
+            fetch_started = time.perf_counter()
+            if batch_step >= total_steps:
                 break
         epoch += 1
     if rank == 0:
-        save_checkpoint(
+        path = save_checkpoint(
             output, denoiser, optimizer, scaler, ema, batch_step, micro_batch_step, epoch, cfg,
             final=True, best_metric=best_metric,
         )
+        reporter.message(f"training finished at step {batch_step:,}; final EMA model: {Path(path).name}")
         logger.close()
     if world > 1:
         dist.destroy_process_group()

@@ -42,6 +42,11 @@ training:
   # Keep the first WSL smoke deterministic and avoid /mnt filesystem worker
   # overhead. The production config exercises persistent multi-worker loading.
   num_workers: 0
+  # Normalization statistics, computed into <output>/stats/motion before the
+  # first step from a fixed random subset of the training split.
+  stats:
+    max_samples: 64
+    batch_size: 8
   learning_rate: 2.0e-5
   weight_decay: 0.0
   gradient_clip: 1.0

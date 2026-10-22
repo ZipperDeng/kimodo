@@ -35,6 +35,11 @@ training:
   expected_global_batch_size: 512
   max_frames: 300
   num_workers: 4
+  # Normalization statistics, computed into <output>/stats/motion before the
+  # first step from a fixed random subset of the training split.
+  stats:
+    max_samples: 50000
+    batch_size: 64
   learning_rate: 2.0e-5
   weight_decay: 0.0
   gradient_clip: 1.0

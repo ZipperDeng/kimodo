@@ -198,12 +198,93 @@ def smooth_signal(x, margins, pos_weight=0, alpha_overrelax=1.8, admm_iters=500,
     return x_smoothed
 
 
-@ensure_batched(hip_translations=3)
-def get_smooth_root_pos(hip_translations):
+def _level_system(n):
+    """ADMM system matrix and step size of one ``n``-point level, as built by ``TrajectorySmoother``."""
+    acceleration = sparse.diags([-1.0, 2.0, -1.0], [0, 1, 2], shape=(max(n - 2, 0), n), format="csr")
+    system = (acceleration.T @ acceleration).tocsr()
+    stepsize = 0.25 * np.sqrt(max(abs(system.diagonal())))
+    return system + stepsize * sparse.eye(n), stepsize
+
+
+def smooth_signals(signals, margin=0.06, alpha_overrelax=1.8, admm_iters=500):
+    """Batched ``smooth_signal`` for constant margins and ``pos_weight=0``.
+
+    Every level solves all signals at once with one block-diagonal factorization,
+    so the 500 ADMM iterations run once per batch instead of once per signal. Each
+    block is the per-signal system, so results match ``smooth_signal`` to float
+    precision.
+
+    Args:
+        signals: Sequence of ``[T_i, D]`` NumPy arrays of possibly different lengths.
+
+    Returns:
+        List of smoothed arrays with the input shapes.
+    """
+    outputs = [np.repeat(x.mean(axis=0, keepdims=True), len(x), axis=0).astype(x.dtype) for x in signals]
+    top_stepsizes = [2 ** max(int(math.floor(math.log2(len(x)))) - 4, 1) for x in signals]
+    stepsize = max(top_stepsizes)
+    while True:
+        # Each signal starts at its own coarsest level, like smooth_signal.
+        active = [i for i, top in enumerate(top_stepsizes) if top >= stepsize]
+        # Levels with fewer than three points have no acceleration term (where
+        # smooth_signal fails on a singular system); they keep their targets.
+        solved = [i for i in active if len(signals[i][::stepsize]) >= 3]
+        for i in active:
+            if i not in solved:
+                outputs[i][::stepsize] = signals[i][::stepsize]
+        if solved:
+            systems = [_level_system(len(signals[i][::stepsize])) for i in solved]
+            sizes = [system.shape[0] for system, _ in systems]
+            system_lu = splu(sparse.block_diag([system for system, _ in systems], format="csc"))
+            admm_stepsize = np.concatenate([np.full(size, step) for size, (_, step) in zip(sizes, systems)])[:, None]
+            targets = np.concatenate([signals[i][::stepsize] for i in solved])
+            x = np.concatenate([outputs[i][::stepsize] for i in solved])
+            z = np.zeros_like(x)
+            u = np.zeros_like(x)
+            for _ in range(admm_iters):
+                z[:] = x + u - targets
+                norms = np.linalg.norm(z, axis=1)
+                mask = norms > margin
+                if np.any(mask):
+                    z[mask] *= (margin / norms[mask])[:, np.newaxis]
+                z += targets
+                u += alpha_overrelax * (x - z)
+                x[:] = system_lu.solve(admm_stepsize * (z - u))
+            offsets = np.cumsum([0] + sizes)
+            for block, i in enumerate(solved):
+                outputs[i][::stepsize] = x[offsets[block] : offsets[block + 1]]
+        next_stepsize = stepsize // 2
+        for i in active:
+            smoothed = outputs[i]
+            # Same interpolation as smooth_signal, including its final pass where
+            # next_stepsize is 0 and the slice spans the whole signal.
+            num_steps = len(smoothed[::stepsize])
+            num_interleaved = len(smoothed[next_stepsize::stepsize])
+            if num_steps == 1:
+                smoothed[next_stepsize::stepsize] = smoothed[0]
+                continue
+            if num_interleaved == num_steps:
+                smoothed[next_stepsize::stepsize][-1] = (
+                    smoothed[::stepsize][-1] + (smoothed[::stepsize][-1] - smoothed[::stepsize][-2]) / 2
+                )
+                num_interleaved = num_interleaved - 1
+            smoothed[next_stepsize::stepsize][:num_interleaved] = (
+                smoothed[::stepsize][:-1] + smoothed[::stepsize][1:]
+            ) / 2
+        if stepsize == 1:
+            break
+        stepsize //= 2
+    return outputs
+
+
+@ensure_batched(hip_translations=3, lengths=1)
+def get_smooth_root_pos(hip_translations, lengths=None):
     """Smooth root trajectory in the ground plane while preserving height.
 
     Args:
         hip_translations: Root translations ``[B, T, 3]``.
+        lengths: Optional valid lengths ``[B]`` of a padded batch. Padding frames
+            are excluded from smoothing and keep their input values.
 
     Returns:
         Smoothed root translations ``[B, T, 3]`` where ``x/z`` are smoothed and
@@ -213,15 +294,13 @@ def get_smooth_root_pos(hip_translations):
     root_translations_y = hip_translations[..., [1]]
 
     batch_size, nframes = root_translations_xz.shape[:2]
-    margins = np.full(root_translations_xz.shape[1], 0.06)
+    lengths = [nframes] * batch_size if lengths is None else [int(length) for length in lengths]
+    root_translations_xz_np = root_translations_xz.detach().cpu().numpy()
+    smoothed = smooth_signals([root_translations_xz_np[batch, :length] for batch, length in enumerate(lengths)])
+    for batch, length in enumerate(lengths):
+        root_translations_xz_np[batch, :length] = smoothed[batch]
 
-    root_translations_smoothed_xz = []
-    for batch in range(batch_size):
-        root_translations_smoothed_xz.append(
-            smooth_signal(root_translations_xz[batch].detach().cpu().numpy(), margins)[None]
-        )
-
-    root_translations_smoothed_xz = torch.tensor(np.concatenate(root_translations_smoothed_xz))
+    root_translations_smoothed_xz = torch.tensor(root_translations_xz_np)
 
     root_translations = torch.cat(
         [

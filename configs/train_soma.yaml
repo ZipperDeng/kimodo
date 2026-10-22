@@ -11,7 +11,7 @@ model:
     motion_rep:
       _target_: kimodo.motion_rep.KimodoMotionRep
       fps: 30
-      stats_path: null  # Injected from <dataset-root>/stats/motion by kimodo_train.
+      stats_path: null  # Injected from <output>/stats/motion by kimodo_train.
       skeleton:
         _target_: kimodo.skeleton.SOMASkeleton30
     llm_shape: [1, 4096]
@@ -36,10 +36,15 @@ training:
   # torchrun WORLD_SIZE and this per-GPU micro-batch size.
   total_batch_steps: 1000000
   phase1_batch_steps: 500000
-  batch_size: 16
+  batch_size: 32
   expected_global_batch_size: 512
   max_frames: 300
   num_workers: 4
+  # Normalization statistics, computed into <output>/stats/motion before the
+  # first step from a fixed random subset of the training split.
+  stats:
+    max_samples: 50000
+    batch_size: 64
   learning_rate: 2.0e-5
   weight_decay: 0.0
   gradient_clip: 1.0
@@ -55,8 +60,8 @@ training:
     enabled: true
     decay: 0.995
     update_every_batch_steps: 10
-  # Used by --dataset-root. Keep the 8B frozen encoder on CPU so GPU memory
-  # remains available to the denoiser; a running TextEncoderAPI may be used instead.
+  # Never instantiated during training: selects the release's
+  # training-vectors/<preset>/ snapshot and is recorded as text-model provenance.
   text_encoder:
     _target_: kimodo.model.LLM2VecEncoder
     base_model_name_or_path: McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp

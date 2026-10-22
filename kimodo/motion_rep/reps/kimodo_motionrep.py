@@ -47,7 +47,7 @@ class KimodoMotionRep(MotionRepBase):
         }
         super().__init__(skeleton, fps, stats_path)
 
-    @ensure_batched(local_joint_rots=5, root_positions=3, lengths=1)
+    @ensure_batched(local_joint_rots=5, root_positions=3, lengths=1, smooth_root_pos=3)
     def __call__(
         self,
         local_joint_rots: torch.Tensor,
@@ -55,6 +55,7 @@ class KimodoMotionRep(MotionRepBase):
         to_normalize: bool,
         to_canonicalize: bool = False,
         lengths: Optional[torch.Tensor] = None,
+        smooth_root_pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Convert local rotations and root trajectory into smooth-root features.
 
@@ -64,6 +65,8 @@ class KimodoMotionRep(MotionRepBase):
             to_normalize: Whether to normalize output features.
             to_canonicalize: Whether to canonicalize output features (False by default).
             lengths: Optional valid lengths for variable-length batches.
+            smooth_root_pos: Optional precomputed ``get_smooth_root_pos(root_positions, lengths)``,
+                e.g. from DataLoader workers, so the CPU smoother stays off the training step.
 
         Returns:
             Motion features with shape ``[B, T, motion_rep_dim]``.
@@ -82,7 +85,9 @@ class KimodoMotionRep(MotionRepBase):
         root_heading_angle = compute_heading_angle(global_joints_positions, self.skeleton)
         global_root_heading = torch.stack([torch.cos(root_heading_angle), torch.sin(root_heading_angle)], dim=-1)
 
-        smooth_root_pos = get_smooth_root_pos(root_positions)
+        if smooth_root_pos is None:
+            smooth_root_pos = get_smooth_root_pos(root_positions, lengths)
+        smooth_root_pos = smooth_root_pos.to(device=root_positions.device, dtype=root_positions.dtype)
         hips_offset = root_positions - smooth_root_pos
         hips_offset[..., 1] = root_positions[..., 1]
         local_joints_positions = local_joints_positions_origin_is_pelvis + hips_offset[:, :, None]

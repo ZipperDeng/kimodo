@@ -6,7 +6,9 @@ import platform
 import socket
 import subprocess
 import sys
-from datetime import datetime, timezone
+import time
+from collections import deque
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import torch
@@ -117,3 +119,108 @@ class ExperimentLogger:
         if self.wandb:
             self.wandb.finish()
         self.stream.close()
+
+
+# Short console names for KimodoLoss components; unknown keys print as-is.
+_COMPONENT_LABELS = {
+    "smooth_root_pos": "root",
+    "global_root_heading": "heading",
+    "local_joints_positions": "joints",
+    "velocities": "vel",
+    "global_rot_data": "rot",
+    "foot_contacts": "contacts",
+    "fk": "fk",
+}
+
+
+def format_duration(seconds: float) -> str:
+    """``1d 02:03:04`` / ``02:03:04`` style duration."""
+    seconds = max(int(round(seconds)), 0)
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    clock = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{days}d {clock}" if days else clock
+
+
+class ProgressReporter:
+    """Rank-zero console lines with throughput, elapsed time and an ETA.
+
+    The ETA uses the step rate over the last ``window`` log intervals, so it
+    follows phase changes and includes validation and checkpoint time.
+    """
+
+    def __init__(self, total_steps: int, start_step: int, global_batch_size: int, window: int = 20, stream=None):
+        self.total_steps = int(total_steps)
+        self.global_batch_size = int(global_batch_size)
+        self.stream = stream or sys.stdout
+        self.started = time.perf_counter()
+        self.history = deque([(self.started, int(start_step))], maxlen=window + 1)
+        self.first_log = True
+
+    def _print(self, text: str) -> None:
+        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {text}", file=self.stream, flush=True)
+
+    def banner(self, lines) -> None:
+        for line in lines:
+            self._print(line)
+
+    def timing(self, step: int) -> dict:
+        """Record a log point and return elapsed/rate/ETA values for it."""
+        now = time.perf_counter()
+        previous_time, previous_step = self.history[-1]
+        interval_steps = max(step - previous_step, 1)
+        if self.first_log:
+            # The first interval includes DataLoader worker startup and warm-up;
+            # start the ETA window after it rather than skew the estimate.
+            self.first_log = False
+            self.history.clear()
+            self.history.append((now, int(step)))
+            eta = None
+        else:
+            self.history.append((now, int(step)))
+            oldest_time, oldest_step = self.history[0]
+            rate = (step - oldest_step) / max(now - oldest_time, 1e-9)
+            eta = (self.total_steps - step) / rate if rate > 0 else None
+        return {
+            "elapsed_seconds": now - self.started,
+            "interval_seconds": now - previous_time,
+            "seconds_per_batch_step": (now - previous_time) / interval_steps,
+            "samples_per_second": interval_steps * self.global_batch_size / max(now - previous_time, 1e-9),
+            "eta_seconds": eta,
+        }
+
+    def step(self, step: int, metrics: dict) -> None:
+        width = len(f"{self.total_steps:,}")
+        eta = metrics["eta_seconds"]
+        parts = [
+            f"step {step:>{width},}/{self.total_steps:,} {100 * step / self.total_steps:5.1f}% P{metrics['phase']}",
+            f"loss {metrics['loss']:.4f}  gnorm {metrics['gradient_norm']:.3g}  lr {metrics['learning_rate']:.2e}",
+            f"{metrics['seconds_per_batch_step']:.2f}s/step  {metrics['samples_per_second']:,.0f} samples/s"
+            f"  data {100 * metrics['data_wait_fraction']:.0f}%",
+        ]
+        if "gpu_memory_allocated_gib" in metrics:
+            parts.append(
+                f"mem {metrics['gpu_memory_allocated_gib']:.1f}/{metrics['gpu_memory_reserved_gib']:.1f}G"
+            )
+        if eta is None:
+            eta_text = "ETA estimating"
+        else:
+            finish = datetime.now() + timedelta(seconds=eta)
+            eta_text = f"ETA {format_duration(eta)} ({finish:%m-%d %H:%M})"
+        parts.append(f"{format_duration(metrics['elapsed_seconds'])} elapsed  {eta_text}")
+        self._print(" | ".join(parts))
+        components = "  ".join(
+            f"{_COMPONENT_LABELS.get(name, name)} {value:.4f}" for name, value in metrics["components"].items()
+        )
+        print(f"{'':22}{components}", file=self.stream, flush=True)
+
+    def validation(self, step: int, metrics: dict, best: float, monitor: str, improved: bool) -> None:
+        note = "new best, saved model-best" if improved else f"best {best:.4f}"
+        components = "  ".join(
+            f"{_COMPONENT_LABELS.get(name, name)} {value:.4f}" for name, value in metrics.items() if name != "loss"
+        )
+        self._print(f"validation @ step {step:,} | {monitor} {metrics[monitor]:.4f} ({note}) | {components}")
+
+    def message(self, text: str) -> None:
+        self._print(text)
